@@ -19,6 +19,7 @@ package org.apache.activemq.ra;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -42,7 +43,7 @@ import org.slf4j.LoggerFactory;
  *  $Date$
  */
 public class ServerSessionPoolImpl implements ServerSessionPool {
-
+    
     private static final Logger LOG = LoggerFactory.getLogger(ServerSessionPoolImpl.class);
 
     private final ActiveMQEndpointWorker activeMQAsfEndpointWorker;
@@ -52,7 +53,10 @@ public class ServerSessionPoolImpl implements ServerSessionPool {
     private final List<ServerSessionImpl> activeSessions = new ArrayList<ServerSessionImpl>();
     private final Lock sessionLock = new ReentrantLock();
     private final AtomicBoolean closing = new AtomicBoolean(false);
-
+    
+    public static final long MAX_SESSION_WAIT_TIME = TimeUnit.MINUTES.toMillis(10);
+    public static final long MAX_SLEEP_TIME = TimeUnit.SECONDS.toMillis(5);
+    
     public ServerSessionPoolImpl(ActiveMQEndpointWorker activeMQAsfEndpointWorker, int maxSessions) {
         this.activeMQAsfEndpointWorker = activeMQAsfEndpointWorker;
         this.maxSessions = maxSessions;
@@ -126,10 +130,16 @@ public class ServerSessionPoolImpl implements ServerSessionPool {
             // restricting us.
             if (ss == null) {
                 if (activeSessions.isEmpty() && idleSessions.isEmpty()) {
-                    throw new JMSException("Endpoint factory did not allow creation of any endpoints.");
+                    LOG.info("Endpoint factory did not allow creation of any endpoints.");
+                    ss = waitForServerSession();
+                    if (ss == null) {
+                        throw new JMSException("Endpoint factory did not allow creation of any endpoints.");
+                    } else {
+                        activeSessions.add(ss);
+                    }
+                } else {
+                    ss = getExistingServerSession(true);
                 }
-
-                ss = getExistingServerSession(true);
             } else {
                 activeSessions.add(ss);
             }
@@ -339,6 +349,34 @@ public class ServerSessionPoolImpl implements ServerSessionPool {
      */
     public void setClosing(boolean closing) {
         this.closing.set(closing);
+    }
+
+    private ServerSessionImpl waitForServerSession() throws JMSException {
+        ServerSessionImpl ss = null;
+        long waitMinutes = 0;
+        long totalWait = 0;
+        for(long waitTime = 100; ss == null && totalWait < MAX_SESSION_WAIT_TIME; waitTime *= 2) {
+            LOG.debug("Endpoint factory did not allow creation of any endpoints");            
+            if (waitTime > MAX_SLEEP_TIME) {
+                waitTime = MAX_SLEEP_TIME;
+            }
+            if (TimeUnit.MILLISECONDS.toMinutes(totalWait) > waitMinutes) {
+                waitMinutes = TimeUnit.MILLISECONDS.toMinutes(totalWait) ;
+                LOG.warn("Already waited {} minutes for a server session", waitMinutes);
+            }
+            try {
+                Thread.sleep(waitTime);
+            } catch (InterruptedException ex) {
+                LOG.error("Interrupted while waiting for server session",ex);
+                return null;
+            }
+            totalWait += waitTime;
+            ss = createServerSessionImpl();
+        }
+        if (ss != null) {
+            LOG.info("Waited {}ms for the server session", totalWait);
+        }
+        return ss;
     }
 
 }
